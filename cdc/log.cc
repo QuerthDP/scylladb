@@ -58,7 +58,7 @@ using namespace std::chrono_literals;
 logging::logger cdc_log("cdc");
 
 namespace cdc {
-static schema_ptr create_log_schema(const schema&, std::optional<table_id> = {}, schema_ptr = nullptr);
+static schema_ptr create_log_schema(const schema&, std::optional<table_id>, schema_ptr, int ttl_seconds);
 }
 
 static constexpr auto cdc_group_name = "cdc";
@@ -168,7 +168,7 @@ public:
             ensure_that_table_uses_vnodes(ksm, schema);
 
             // in seastar thread
-            auto log_schema = create_log_schema(schema);
+            auto log_schema = create_log_schema(schema, {}, nullptr, schema.cdc_options().ttl());
 
             auto log_mut = db::schema_tables::make_create_table_mutations(log_schema, timestamp);
 
@@ -177,6 +177,13 @@ public:
     }
 
     void on_before_update_column_family(const schema& new_schema, const schema& old_schema, utils::chunked_vector<mutation>& mutations, api::timestamp_type timestamp) override {
+        bool has_vector_index = secondary_index::vector_index::has_vector_index(new_schema);
+        if (has_vector_index) {
+            // If we have a vector index, we need to ensure that the CDC log is created
+            // satisfying the minimal requirements of Vector Search.
+            secondary_index::vector_index::check_cdc_options(new_schema);
+        }
+
         bool is_cdc = cdc_enabled(new_schema);
         bool was_cdc = cdc_enabled(old_schema);
 
@@ -206,9 +213,11 @@ public:
             ensure_that_table_has_no_counter_columns(new_schema);
             ensure_that_table_uses_vnodes(*keyspace.metadata(), new_schema);
 
-            auto new_log_schema = create_log_schema(new_schema, log_schema ? std::make_optional(log_schema->id()) : std::nullopt, log_schema);
+            int ttl_seconds = std::max(new_schema.cdc_options().ttl(), has_vector_index ? secondary_index::vector_index::VS_TTL_SECONDS : 0);
 
-            auto log_mut = log_schema 
+            auto new_log_schema = create_log_schema(new_schema, log_schema ? std::make_optional(log_schema->id()) : std::nullopt, log_schema, ttl_seconds);
+
+            auto log_mut = log_schema
                 ? db::schema_tables::make_update_table_mutations(db, keyspace.metadata(), log_schema, new_log_schema, timestamp)
                 : db::schema_tables::make_create_table_mutations(new_log_schema, timestamp)
                 ;
@@ -501,12 +510,11 @@ bytes log_data_column_deleted_elements_name_bytes(const bytes& column_name) {
     return to_bytes(cdc_deleted_elements_column_prefix) + column_name;
 }
 
-static schema_ptr create_log_schema(const schema& s, std::optional<table_id> uuid, schema_ptr old) {
+static schema_ptr create_log_schema(const schema& s, std::optional<table_id> uuid, schema_ptr old, int ttl_seconds) {
     schema_builder b(s.ks_name(), log_name(s.cf_name()));
     b.with_partitioner(cdc::cdc_partitioner::classname);
     b.set_compaction_strategy(sstables::compaction_strategy_type::time_window);
     b.set_comment(fmt::format("CDC log for {}.{}", s.ks_name(), s.cf_name()));
-    auto ttl_seconds = s.cdc_options().ttl();
     if (ttl_seconds > 0) {
         b.set_gc_grace_seconds(0);
         auto ceil = [] (int dividend, int divisor) {
@@ -902,10 +910,14 @@ public:
           _base_pk(base_pk.explode_fragmented()),
           _tuuid(timeuuid_type->decompose(generate_timeuuid(ts))),
           _ts(ts),
-          _ttl(_base_schema.cdc_options().ttl()
-                  ? std::optional{std::chrono::seconds(_base_schema.cdc_options().ttl())} : std::nullopt),
+          _ttl(determine_cdc_ttl(base_schema)),
           _log_mut(log_mut)
     {}
+
+    std::optional<std::chrono::seconds> determine_cdc_ttl(const schema& schema) const {
+        int ttl_value = std::max(schema.cdc_options().ttl(), secondary_index::vector_index::has_vector_index(schema) ? secondary_index::vector_index::VS_TTL_SECONDS : 0);
+        return ttl_value ? std::optional{std::chrono::seconds{ttl_value}} : std::nullopt;
+    }
 
     const schema& base_schema() const {
         return _base_schema;
@@ -1037,7 +1049,9 @@ static ttl_opt get_ttl(const row_marker& rm) {
  * Returns whether we should generate cdc delta values (beyond keys)
  */
 static bool generate_delta_values(const schema& s) {
-    return s.cdc_options().get_delta_mode() == cdc::delta_mode::full;
+    auto options = s.cdc_options();
+    return options.get_delta_mode() == cdc::delta_mode::full ||
+           (!options.postimage() && secondary_index::vector_index::has_vector_index(s));
 }
 
 /* Visits the cells and tombstones of a single base mutation row and constructs corresponding delta-row cells
