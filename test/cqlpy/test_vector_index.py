@@ -7,7 +7,7 @@
 ###############################################################################
 
 import pytest
-from .util import new_test_table, is_scylla
+from .util import new_test_table, is_scylla, unique_name
 from cassandra.protocol import InvalidRequest, ConfigurationException
 
 @pytest.mark.parametrize("test_keyspace",
@@ -145,3 +145,129 @@ def test_describe_custom_index(cql, test_keyspace):
 
         assert f"CREATE CUSTOM INDEX custom ON {table}{maybe_space}(v1) USING '{custom_class}'" in a_desc
         assert f"CREATE CUSTOM INDEX custom1 ON {table}{maybe_space}(v2) USING '{custom_class}'" in b_desc
+
+
+###############################################################################
+# Tests for CDC with vector indexes
+#
+# The following tests verify that the constraints between Vector Search
+# and CDC settings are properly enforced.
+#
+# If a vector index is created, CDC may only be enabled with options meeting
+# the Vector Search requirements:
+#   - CDC TTL must be at least 24 hours (86400 seconds) OR set to 0 (infinite).
+#   - CDC delta mode must be set to 'full'.
+#
+# We test that:
+#   * Enabling CDC with default or valid options succeeds.
+#   * Enabling CDC with invalid TTL (< 24h) or invalid delta is rejected.
+#   * Preimage/postimage options can be freely toggled.
+#   * Disabling CDC is not allowed when a vector index already exists.
+#
+# We also verify that creating a vector index is forbidden
+# if CDC is enabled but uses invalid options, and allowed only when CDC is
+# either disabled or configured to satisfy the minimal Vector Search requirements.
+#
+###############################################################################
+
+
+VS_TTL_SECONDS = 86400  # 24 hours
+
+
+def alter_cdc(cql, table, options):
+    try:
+        cql.execute(f"ALTER TABLE {table} WITH cdc = {options}")
+    except InvalidRequest as e:
+        with pytest.raises(InvalidRequest, match="CDC log must meet the minimal requirements of Vector Search"):
+            raise e
+        return False
+    return True
+
+
+def create_index(cql, test_keyspace, table, column):
+    idx_name = f"{column}_idx_{unique_name()}"
+    query = f"CREATE INDEX {idx_name} ON {table} ({column}) USING 'vector_index'"
+    try:
+        cql.execute(query)
+    except InvalidRequest as e:
+        with pytest.raises(InvalidRequest, match="CDC log must meet the minimal requirements of Vector Search"):
+            raise e
+        return False
+    cql.execute(f"DROP INDEX {test_keyspace}.{idx_name}")
+    return True
+
+
+@pytest.mark.parametrize("test_keyspace",
+                         [pytest.param("tablets", marks=[pytest.mark.xfail(reason="issue #16317")]), "vnodes"],
+                         indirect=True)
+def test_try_create_cdc_with_vector_search_enabled(scylla_only, cql, test_keyspace):
+    schema = "pk int primary key, v vector<float, 3>"
+    with new_test_table(cql, test_keyspace, schema) as table:
+        # The vector index requires CDC to be enabled with specific options:
+        # - TTL must be at least 24 hours (86400 seconds)
+        # - delta mode must be set to 'full'
+
+        # Enable Vector Search by creating a vector index.
+        cql.execute(f"CREATE INDEX v_idx ON {table} (v) USING 'vector_index'")
+
+        # Allow creating CDC log table with default options
+        assert alter_cdc(cql, table, {"enabled": True})
+
+        # Disallow changing CDC's TTL to less than 24 hours
+        assert not alter_cdc(cql, table, {"enabled": True, "ttl": 1})
+        assert alter_cdc(cql, table, {"enabled": True, "ttl": 86400})
+
+        # Allow changing CDC's TTL to 0 (infinite)
+        assert alter_cdc(cql, table, {"enabled": True, "ttl": 0})
+
+        # Disallow changing CDC's delta to 'keys'
+        assert not alter_cdc(cql, table, {"enabled": True, "delta": "keys"})
+        assert alter_cdc(cql, table, {"enabled": True, "delta": "full"})
+
+        # Allow changing CDC's preimage and postimage
+        assert alter_cdc(cql, table, {"enabled": True, "preimage": True})
+        assert alter_cdc(cql, table, {"enabled": True, "postimage": True})
+        assert alter_cdc(cql, table, {"enabled": True, "preimage": False})
+        assert alter_cdc(cql, table, {"enabled": True, "postimage": False})
+        assert alter_cdc(cql, table, {"enabled": True, "preimage": True, "postimage": True})
+
+
+@pytest.mark.parametrize("test_keyspace",
+                         [pytest.param("tablets", marks=[pytest.mark.xfail(reason="issue #16317")]), "vnodes"],
+                         indirect=True)
+def test_try_disable_cdc_with_vector_search_enabled(scylla_only, cql, test_keyspace):
+    schema = "pk int primary key, v vector<float, 3>"
+    with new_test_table(cql, test_keyspace, schema) as table:
+        # Enable Vector Search by creating a vector index.
+        cql.execute(f"CREATE INDEX v_idx ON {table} (v) USING 'vector_index'")
+
+        # Disallow disabling CDC when Vector Search is enabled
+        with pytest.raises(InvalidRequest, match="Cannot disable CDC when Vector Search is enabled on the table"):
+            cql.execute(f"ALTER TABLE {table} WITH cdc = {{'enabled': False}}")
+
+
+@pytest.mark.parametrize("test_keyspace",
+                         [pytest.param("tablets", marks=[pytest.mark.xfail(reason="issue #16317")]), "vnodes"],
+                         indirect=True)
+def test_try_enable_vector_search_with_cdc_enabled(scylla_only, cql, test_keyspace):
+    schema = "pk int primary key, v vector<float, 3>"
+    with new_test_table(cql, test_keyspace, schema) as table:
+        # The vector index requires CDC to be enabled with specific options:
+        # - TTL must be at least 24 hours (86400 seconds)
+        # - delta mode must be set to 'full'
+
+        # Disallow creating the vector index when CDC's TTL is less than 24h
+        assert alter_cdc(cql, table, {'enabled': True, 'ttl': 1})
+        assert not create_index(cql, test_keyspace, table, "v")
+
+        # Allow creating the vector index when CDC's TTL is 0 (infinite)
+        assert alter_cdc(cql, table, {'enabled': True, 'ttl': 0})
+        assert create_index(cql, test_keyspace, table, "v")
+
+        # Disallow creating the vector index when CDC's delta is set to 'keys'
+        assert alter_cdc(cql, table, {'enabled': True, 'delta': 'keys'})
+        assert not create_index(cql, test_keyspace, table, "v")
+
+        # Allow creating the vector index when CDC's options fulfill the minimal requirements of Vector Search
+        assert alter_cdc(cql, table, {'enabled': True, 'ttl': 172800, 'delta': 'full', 'preimage': True, 'postimage': True})
+        assert create_index(cql, test_keyspace, table, "v")
