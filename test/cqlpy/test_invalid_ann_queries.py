@@ -16,7 +16,6 @@ from cassandra.protocol import InvalidRequest
 ANN_REQUIRES_INDEX_MESSAGE = "ANN ordering by vector requires the column to be indexed"
 SCYLLA_ANN_REQUIRES_INDEXED_FILTERING_MESSAGE = "ANN ordering by vector does not support filtering"
 CASSANDRA_ANN_REQUIRES_INDEXED_FILTERING_MESSAGE = "ANN ordering by vector requires all restricted column(s) to be indexed"
-NEED_DATA_FILTERING_MESSAGE = "If you want to execute this query despite the performance unpredictability, use ALLOW FILTERING"
 
 
 def test_ann_query_without_index(cql, test_keyspace):
@@ -34,7 +33,7 @@ def test_ann_query_with_ck_filtering(cql, test_keyspace):
     with new_test_table(cql, test_keyspace, schema) as table:
         custom_index = 'vector_index' if is_scylla(cql) else 'sai'
         cql.execute(f"CREATE CUSTOM INDEX ON {table}(v) USING '{custom_index}'")
-        with pytest.raises(InvalidRequest, match=re.escape(NEED_DATA_FILTERING_MESSAGE)):
+        with pytest.raises(InvalidRequest, match=re.escape(ANN_REQUIRES_INDEXED_FILTERING_MESSAGE)):
             cql.execute(f"SELECT * FROM {table} WHERE ck = 1 ORDER BY v ANN OF [0.1, 0.2, 0.3] LIMIT 5")
         with pytest.raises(InvalidRequest, match=re.escape(ANN_REQUIRES_INDEXED_FILTERING_MESSAGE)):
             cql.execute(f"SELECT * FROM {table} WHERE ck = 1 ORDER BY v ANN OF [0.1, 0.2, 0.3] LIMIT 5 ALLOW FILTERING")
@@ -45,8 +44,7 @@ def test_ann_query_with_ck_filtering(cql, test_keyspace):
 def test_ann_query_not_allow_any_filtering(scylla_only, cql, test_keyspace):
     schema = 'p int primary key, c int, v vector<float, 3>'
     with new_test_table(cql, test_keyspace, schema) as table:
-        custom_index = 'vector_index' if is_scylla(cql) else 'sai'
-        cql.execute(f"CREATE CUSTOM INDEX ON {table}(v) USING '{custom_index}'")
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(v) USING 'vector_index'")
 
         cql.execute(f"CREATE INDEX ON {table}(c)")
         with pytest.raises(InvalidRequest, match=re.escape(SCYLLA_ANN_REQUIRES_INDEXED_FILTERING_MESSAGE)):
