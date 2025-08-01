@@ -983,6 +983,14 @@ primary_key_select_statement::primary_key_select_statement(schema_ptr schema, ui
     }
 }
 
+bool check_needs_allow_filtering_anyway(const restrictions::statement_restrictions& restrictions) {
+    // Even if no filtering happens on the coordinator, we still warn about poor performance when partition
+    // slice is defined but in potentially unlimited number of partitions (see #7608).
+    return (restrictions.partition_key_restrictions_is_empty() || restrictions.has_token_restrictions()) // Potentially unlimited partitions.
+            && restrictions.has_clustering_columns_restriction() // Slice defined.
+            && !restrictions.uses_secondary_indexing(); // Base-table is used. (Index-table use always limits partitions.)
+}
+
 ::shared_ptr<cql3::statements::select_statement>
 indexed_table_select_statement::prepare(data_dictionary::database db,
                                         schema_ptr schema,
@@ -1012,9 +1020,9 @@ indexed_table_select_statement::prepare(data_dictionary::database db,
         });
 
         if (it == indexes.end()) {
-            throw exceptions::invalid_request_exception("ANN ordering by vector requires the column to be indexed");
+            throw exceptions::invalid_request_exception("ANN ordering by vector requires the column to be indexed using 'vector_index'");
         } else {
-            if (index_opt || parameters->allow_filtering() || restrictions->need_filtering() ) {
+            if (index_opt || parameters->allow_filtering() || restrictions->need_filtering() || check_needs_allow_filtering_anyway(*restrictions)) {
                 throw exceptions::invalid_request_exception("ANN ordering by vector does not support filtering");
             }
             index_opt = *it;
@@ -2145,8 +2153,10 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
     }
 
     std::vector<sstring> warnings;
-    check_needs_filtering(*restrictions, db.get_config().strict_allow_filtering(), warnings);
-    ensure_filtering_columns_retrieval(db, *selection, *restrictions);
+    if (!prepared_ann_ordering.has_value()) {
+        check_needs_filtering(*restrictions, db.get_config().strict_allow_filtering(), warnings);
+        ensure_filtering_columns_retrieval(db, *selection, *restrictions);
+    }
     auto group_by_cell_indices = ::make_shared<std::vector<size_t>>(prepare_group_by(*schema, *selection));
 
     if (_parameters->is_distinct() && group_by_references_clustering_keys(*selection, *group_by_cell_indices)) {
@@ -2573,13 +2583,7 @@ static bool needs_allow_filtering_anyway(
     if (strict_allow_filtering == flag_t::FALSE) {
         return false;
     }
-    const auto& ck_restrictions = restrictions.get_clustering_columns_restrictions();
-    const auto& pk_restrictions = restrictions.get_partition_key_restrictions();
-    // Even if no filtering happens on the coordinator, we still warn about poor performance when partition
-    // slice is defined but in potentially unlimited number of partitions (see #7608).
-    if ((restrictions::is_empty_restriction(pk_restrictions) || restrictions.has_token_restrictions()) // Potentially unlimited partitions.
-        && !restrictions::is_empty_restriction(ck_restrictions) // Slice defined.
-        && !restrictions.uses_secondary_indexing()) { // Base-table is used. (Index-table use always limits partitions.)
+    if (check_needs_allow_filtering_anyway(restrictions)) {
         if (strict_allow_filtering == flag_t::WARN) {
             warnings.emplace_back("This query should use ALLOW FILTERING and will be rejected in future versions.");
             return false;
