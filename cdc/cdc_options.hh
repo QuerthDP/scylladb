@@ -48,10 +48,10 @@ public:
 
     bool enabled() const { return _enabled.value_or(false); }
     bool is_enabled_set() const { return _enabled.has_value(); }
-    bool preimage() const { return _preimage != image_mode::off; }
-    bool full_preimage() const { return _preimage == image_mode::full; }
-    bool postimage() const { return _postimage; }
-    delta_mode get_delta_mode() const { return _delta_mode; }
+    bool preimage() const { return enabled() && _preimage != image_mode::off; }
+    bool full_preimage() const { return enabled() && _preimage == image_mode::full; }
+    bool postimage() const { return enabled() && _postimage; }
+    delta_mode get_delta_mode() const { return enabled() ? _delta_mode : delta_mode::full; }
     void set_delta_mode(delta_mode m) { _delta_mode = m; }
     int ttl() const { return _ttl; }
 
