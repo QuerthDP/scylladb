@@ -35,9 +35,8 @@ public:
         return false;
     }
 
-    virtual bytes_opt execute(std::span<const bytes_opt> parameters, const expr::evaluation_inputs& inputs) override {
-        return std::nullopt; // Unimplemented
-    }
+
+    virtual bytes_opt execute(std::span<const bytes_opt> parameters, const expr::evaluation_inputs& inputs) override;
 };
 
 class similarity_cosine_fct: public vector_similarity_fct {
@@ -46,9 +45,8 @@ public:
         : vector_similarity_fct(s, "similarity_cosine") {
     }
 
-    virtual bytes_opt execute(std::span<const bytes_opt> parameters, const expr::evaluation_inputs& inputs) override {
-        return std::nullopt; // Unimplemented
-    }
+
+    virtual bytes_opt execute(std::span<const bytes_opt> parameters, const expr::evaluation_inputs& inputs) override;
 };
 
 
@@ -58,9 +56,8 @@ public:
         : vector_similarity_fct(s, "similarity_euclidean") {
     }
 
-    virtual bytes_opt execute(std::span<const bytes_opt> parameters, const expr::evaluation_inputs& inputs) override {
-        return std::nullopt; // Unimplemented
-    }
+
+    virtual bytes_opt execute(std::span<const bytes_opt> parameters, const expr::evaluation_inputs& inputs) override;
 };
 
 class similarity_dot_product_fct: public vector_similarity_fct {
@@ -69,9 +66,7 @@ public:
         : vector_similarity_fct(s, "similarity_dot_product") {
     }
 
-    virtual bytes_opt execute(std::span<const bytes_opt> parameters, const expr::evaluation_inputs& inputs) override {
-        return std::nullopt; // Unimplemented
-    }
+    virtual bytes_opt execute(std::span<const bytes_opt> parameters, const expr::evaluation_inputs& inputs) override;
 };
 
 }
