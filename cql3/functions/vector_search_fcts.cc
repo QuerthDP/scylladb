@@ -13,15 +13,17 @@ namespace cql3 {
 namespace functions {
 namespace {
 
-static size_t find_matching_key_index(const std::span<const bytes_opt>& parameters, const std::vector<cql3::statements::primary_key>& keys) {
+static size_t find_matching_key_index(const expr::evaluation_inputs& inputs, const std::vector<cql3::statements::primary_key>& keys) {
     for (size_t i = 0; i < keys.size(); ++i) {
         auto primary_key = std::move(keys[i]);
         auto partition_key = primary_key.partition.key().explode();
         auto clustering_key = primary_key.clustering.explode();
 
         // Check if partition key matches
-        if (std::equal(partition_key.begin(), partition_key.end(), parameters.begin())) {
-            if (std::equal(clustering_key.begin(), clustering_key.end(), parameters.begin() + partition_key.size())) {
+        if (partition_key.size() == inputs.partition_key.size() &&
+            std::equal(partition_key.begin(), partition_key.end(), inputs.partition_key.begin())) {
+            if (clustering_key.size() == inputs.clustering_key.size() &&
+                std::equal(clustering_key.begin(), clustering_key.end(), inputs.clustering_key.begin())) {
                 return i;
             }
         }
@@ -43,7 +45,7 @@ bytes_opt vector_similarity_fct::execute(std::span<const bytes_opt> parameters, 
         throw exceptions::invalid_request_exception("vector_similarity function can only be used with ANN queries");
     }
 
-    size_t index = find_matching_key_index(parameters, keys);
+    size_t index = find_matching_key_index(inputs, keys);
     if (index == keys.size()) {
         throw std::runtime_error("No matching distance found for given primary key");
     }
