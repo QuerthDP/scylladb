@@ -21,10 +21,9 @@ static size_t find_matching_key_index(const expr::evaluation_inputs& inputs, con
         auto clustering_key = primary_key.clustering.explode();
 
         // Check if partition key matches
-        if (partition_key.size() == inputs.partition_key.size() &&
-            std::equal(partition_key.begin(), partition_key.end(), inputs.partition_key.begin())) {
+        if (partition_key.size() == inputs.partition_key.size() && std::equal(partition_key.begin(), partition_key.end(), inputs.partition_key.begin())) {
             if (clustering_key.size() == inputs.clustering_key.size() &&
-                std::equal(clustering_key.begin(), clustering_key.end(), inputs.clustering_key.begin())) {
+                    std::equal(clustering_key.begin(), clustering_key.end(), inputs.clustering_key.begin())) {
                 return i;
             }
         }
@@ -32,7 +31,7 @@ static size_t find_matching_key_index(const expr::evaluation_inputs& inputs, con
     return keys.size(); // Not found
 }
 
-}
+} // namespace
 
 std::vector<data_type> vector_similarity_fct::provide_arg_types(
         const std::vector<shared_ptr<assignment_testable>>& provided_args, const data_dictionary::database& db) {
@@ -84,7 +83,9 @@ bytes_opt vector_similarity_fct::execute(std::span<const bytes_opt> parameters, 
 }
 
 bytes_opt similarity_cosine_fct::execute(std::span<const bytes_opt> parameters, const expr::evaluation_inputs& inputs) {
-    if (std::any_of(parameters.begin(), parameters.end(), [](const auto& param){ return !param; })) {
+    if (std::any_of(parameters.begin(), parameters.end(), [](const auto& param) {
+            return !param;
+        })) {
         return std::nullopt;
     }
 
@@ -92,7 +93,9 @@ bytes_opt similarity_cosine_fct::execute(std::span<const bytes_opt> parameters, 
 }
 
 bytes_opt similarity_euclidean_fct::execute(std::span<const bytes_opt> parameters, const expr::evaluation_inputs& inputs) {
-    if (std::any_of(parameters.begin(), parameters.end(), [](const auto& param){ return !param; })) {
+    if (std::any_of(parameters.begin(), parameters.end(), [](const auto& param) {
+            return !param;
+        })) {
         return std::nullopt;
     }
 
@@ -100,12 +103,14 @@ bytes_opt similarity_euclidean_fct::execute(std::span<const bytes_opt> parameter
 }
 
 bytes_opt similarity_dot_product_fct::execute(std::span<const bytes_opt> parameters, const expr::evaluation_inputs& inputs) {
-    if (std::any_of(parameters.begin(), parameters.end(), [](const auto& param){ return !param; })) {
+    if (std::any_of(parameters.begin(), parameters.end(), [](const auto& param) {
+            return !param;
+        })) {
         return std::nullopt;
     }
 
     return vector_similarity_fct::execute(parameters, inputs);
 }
 
-}
-}
+} // namespace functions
+} // namespace cql3
