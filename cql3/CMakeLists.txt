@@ -120,6 +120,7 @@ target_sources(cql3
     selection/selection.cc
     selection/selector.cc
     restrictions/statement_restrictions.cc
+    restrictions/to_vector_search_filter.cc
     result_set.cc
     prepare_context.cc
     ${cql_grammar_srcs})
