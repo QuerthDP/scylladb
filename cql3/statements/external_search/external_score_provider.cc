@@ -19,16 +19,30 @@
 
 namespace cql3::statements {
 
-external_score_provider::external_score_provider(const vector_search::vector_store_client::primary_keys& results, size_t external_value_index,
-        const schema& schema)
+external_score_provider::external_score_provider(const vector_search::vector_store_client::primary_keys& results,
+        std::optional<size_t> external_value_index, const schema& schema, vector_search::vector_store_client::highlights highlights,
+        std::optional<size_t> highlight_external_value_index)
     : _results(results)
     , _current_index(0)
     , _external_value_index(external_value_index)
-    , _schema(schema) {
+    , _schema(schema)
+    , _highlights(std::move(highlights))
+    , _current_row(0)
+    , _highlight_external_value_index(highlight_external_value_index) {
 }
 
 bool external_score_provider::try_fill(std::vector<cql3::raw_value>& external_values, std::span<const bytes> partition_key,
         std::span<const bytes> clustering_key, const query::result_row_view&, const query::result_row_view*) const {
+    const auto row = _current_row++;
+
+    if (_highlight_external_value_index && row < _highlights.size()) {
+        external_values[*_highlight_external_value_index] = cql3::raw_value::make_value(utf8_type->decompose(_highlights[row]));
+    }
+
+    if (!_external_value_index) {
+        return true;
+    }
+
     const auto row_pk = ::partition_key::from_range(partition_key);
     const auto row_ck = (_schema.clustering_key_size() > 0) ? ::clustering_key_prefix::from_range(clustering_key) : ::clustering_key_prefix{};
 
@@ -60,7 +74,7 @@ bool external_score_provider::try_fill(std::vector<cql3::raw_value>& external_va
             return false;
         }
 
-        external_values[_external_value_index] = cql3::raw_value::make_value(float_type->decompose(score));
+        external_values[*_external_value_index] = cql3::raw_value::make_value(float_type->decompose(score));
         return true;
     }
 

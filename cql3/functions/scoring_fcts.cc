@@ -31,5 +31,20 @@ shared_ptr<function> make_bm25_function() {
         });
 }
 
+shared_ptr<function> make_highlight_function() {
+    // Fulltext highlighting function: highlight(column, query) -> text
+    // Registered with utf8_type args; ascii is implicitly coerced to utf8 by the type system.
+    //
+    // Like BM25(), the excerpt cannot be derived from the visible arguments - it is computed by
+    // the Vector Store, which owns the analyzer and the term statistics. Marked non-pure so the
+    // expression evaluator does not constant-fold it at prepare time.
+    return make_native_scalar_function<false>("highlight", utf8_type, {utf8_type, utf8_type},
+        [] (std::span<const bytes_opt>) -> bytes_opt {
+            // HIGHLIGHT() is replaced by an external_value at prepare time for every valid query
+            // path. Reaching the function body means that replacement did not happen - a bug.
+            on_internal_error(log, "HIGHLIGHT() reached scalar evaluation; prepare-time replacement should have prevented this");
+        });
+}
+
 } // namespace functions
 } // namespace cql3

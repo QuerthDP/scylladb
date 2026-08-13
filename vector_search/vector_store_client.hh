@@ -62,6 +62,8 @@ public:
     using primary_keys = std::vector<primary_key>;
     using schema_ptr = lw_shared_ptr<schema const>;
     using status_type = http::reply::status_type;
+    using documents = std::vector<sstring>;
+    using highlights = std::vector<sstring>;
 
     using disabled = disabled_error;
     using aborted = aborted_error;
@@ -117,6 +119,12 @@ public:
     /// more relevant).
     auto bm25(keyspace_name keyspace, index_name name, schema_ptr schema, query_string fts_query, limit limit, abort_source& as)
             -> future<std::expected<primary_keys, fts_error>>;
+
+    /// Request a highlighted excerpt for each of the given document texts. The texts are
+    /// supplied by the caller - the index keeps no copy of them - and the returned excerpts
+    /// are aligned by position with `docs`.
+    auto highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents docs, abort_source& as)
+            -> future<std::expected<highlights, fts_error>>;
 
 private:
     friend struct vector_store_client_tester;

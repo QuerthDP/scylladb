@@ -14,10 +14,12 @@
 #include "cql3/expr/expr-utils.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/restrictions/statement_restrictions.hh"
+#include "cql3/selection/selection.hh"
 #include "index/secondary_index_manager.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "db/consistency_level_validations.hh"
 #include "exceptions/exceptions.hh"
+#include "query/query-result-reader.hh"
 #include "types/types.hh"
 #include "utils/assert.hh"
 
@@ -28,20 +30,20 @@ namespace cql3::statements {
 
 namespace {
 
-const column_definition* extract_column_from_first_argument(const expr::function_call& fc) {
+const column_definition* extract_column_from_first_argument(const expr::function_call& fc, std::string_view function_name = "BM25") {
     const auto* col_val = expr::as_if<expr::column_value>(&fc.args[0]);
     if (!col_val) {
-        throw exceptions::invalid_request_exception("First argument to BM25 must be a column reference");
+        throw exceptions::invalid_request_exception(seastar::format("First argument to {} must be a column reference", function_name));
     }
     return col_val->col;
 }
 
-expr::expression extract_search_term_from_second_argument(const expr::function_call& fc) {
+expr::expression extract_search_term_from_second_argument(const expr::function_call& fc, std::string_view function_name = "BM25") {
     expr::expression search_term = fc.args[1];
     if (expr::find_in_expression<expr::column_value>(search_term, [](const expr::column_value&) {
             return true;
         })) {
-        throw exceptions::invalid_request_exception("Second argument to BM25() must not be a column reference");
+        throw exceptions::invalid_request_exception(seastar::format("Second argument to {}() must not be a column reference", function_name));
     }
     return search_term;
 }
@@ -126,6 +128,55 @@ bool prepare_bm25_selectors(std::vector<selection::prepared_selector>& prepared_
     }
 
     return ordering_info && ordering_info->external_value_index.has_value();
+}
+
+bool prepare_highlight_selectors(
+        std::vector<selection::prepared_selector>& prepared_selectors, std::optional<bm25_ordering_info>& ordering_info, size_t index) {
+    for (auto& ps : prepared_selectors) {
+        ps.expr = expr::search_and_replace(ps.expr, [&](const expr::expression& candidate) -> std::optional<expr::expression> {
+            const auto* fc = expr::as_if<expr::function_call>(&candidate);
+            if (!fc || !expr::is_native_function_call(*fc, "highlight")) {
+                return std::nullopt;
+            }
+
+            if (!ordering_info) {
+                throw exceptions::invalid_request_exception(
+                        "HIGHLIGHT() is not supported in the SELECT clause without matching ORDER BY and WHERE clauses");
+            }
+
+            if (!ordering_info->highlight_external_value_index) {
+                ordering_info->highlight_external_value_index = index;
+            }
+
+            const auto* col = extract_column_from_first_argument(*fc, "HIGHLIGHT");
+            if (col->name_as_text() != ordering_info->index.target_column()) {
+                throw exceptions::invalid_request_exception("HIGHLIGHT() must reference the same column as BM25() in WHERE and ORDER BY");
+            }
+            ordering_info->highlight_column = col;
+
+            auto sel_term = extract_search_term_from_second_argument(*fc, "HIGHLIGHT");
+
+            const auto* sel_const = expr::as_if<expr::constant>(&sel_term);
+            const auto* ord_const = expr::as_if<expr::constant>(&ordering_info->search_term);
+            if (sel_const && ord_const && *sel_const != *ord_const) {
+                throw exceptions::invalid_request_exception("HIGHLIGHT() must use the same search term as BM25() in WHERE and ORDER BY");
+            }
+
+            // Store term for runtime validation unless both are literal constants
+            // (already validated at prepare time).
+            if (!sel_const || !ord_const) {
+                ordering_info->selected_highlight_terms.push_back(std::move(sel_term));
+            }
+
+            return expr::expression(expr::external_value{
+                    .index = *ordering_info->highlight_external_value_index,
+                    .type = utf8_type,
+                    .replaced_expr = candidate,
+            });
+        });
+    }
+
+    return ordering_info && ordering_info->highlight_external_value_index.has_value();
 }
 
 std::optional<bm25_ordering_info> get_bm25_ordering_info(
@@ -227,6 +278,13 @@ std::optional<bm25_ordering_info> get_bm25_ordering_info(
         }
     }
 
+    // HIGHLIGHT() excerpts the row's own text, so the indexed column has to be fetched from the
+    // base table even when the user did not select it. Remember where it lands in the selection:
+    // that is where execute_search() reads the text it ships to the Vector Store.
+    if (ordering_info->highlight_external_value_index) {
+        ordering_info->highlight_column_selector_index = selection->add_column_for_post_processing(*ordering_info->highlight_column);
+    }
+
     return ::make_shared<cql3::statements::fulltext_indexed_table_select_statement>(
             schema,
             bound_terms,
@@ -287,6 +345,13 @@ future<shared_ptr<cql_transport::messages::result_message>> fulltext_indexed_tab
         }
     }
 
+    for (const auto& sel_term : _bm25_ordering_info.selected_highlight_terms) {
+        const auto sel_val = expr::evaluate(sel_term, options);
+        if (sel_val != search_term_val) {
+            throw exceptions::invalid_request_exception("HIGHLIGHT() must use the same search term as BM25() in ORDER BY and WHERE");
+        }
+    }
+
     auto search_term_bytes = std::move(search_term_val).to_bytes();
     sstring search_term_text = value_cast<sstring>(utf8_type->deserialize(search_term_bytes));
 
@@ -298,10 +363,52 @@ future<shared_ptr<cql_transport::messages::result_message>> fulltext_indexed_tab
 
     throwing_assert(pkeys->size() <= limit);
 
-    auto provider = _bm25_ordering_info.external_value_index
-                            ? std::make_unique<external_score_provider>(pkeys.value(), *_bm25_ordering_info.external_value_index, *_schema)
-                            : nullptr;
-    co_return co_await query_base_table(qp, state, options, pkeys.value(), timeout, std::move(provider));
+    if (!_bm25_ordering_info.external_value_index && !_bm25_ordering_info.highlight_external_value_index) {
+        co_return co_await query_base_table(qp, state, options, pkeys.value(), timeout);
+    }
+
+    external_values_provider_factory make_provider =
+            [this, &qp, &options, &pkeys, &search_term_text, &as = aoe.abort_source()](const query::result& rows,
+                    const query::partition_slice& slice) -> future<std::unique_ptr<cql3::selection::external_values_provider>> {
+        vector_search::vector_store_client::highlights highlights;
+        if (_bm25_ordering_info.highlight_external_value_index) {
+            highlights = co_await fetch_highlights(qp, options, rows, slice, search_term_text, as);
+        }
+        co_return std::make_unique<external_score_provider>(pkeys.value(), _bm25_ordering_info.external_value_index, *_schema,
+                std::move(highlights), _bm25_ordering_info.highlight_external_value_index);
+    };
+
+    co_return co_await query_base_table(qp, state, options, pkeys.value(), timeout, std::move(make_provider));
+}
+
+future<vector_search::vector_store_client::highlights> fulltext_indexed_table_select_statement::fetch_highlights(query_processor& qp,
+        const query_options& options, const query::result& rows, const query::partition_slice& slice, const sstring& search_term,
+        abort_source& as) const {
+
+    // The excerpt has to be computed from text that only the base table has, so assemble the rows
+    // once to read it out, ship it to the Vector Store, and let the real pass consume the answers.
+    // The rows are visited in the same order both times, so the n-th excerpt belongs to the n-th row.
+    cql3::selection::result_set_builder builder(*_selection, _query_start_time_point, &options);
+    auto harvested = co_await builder.with_thread_if_needed([&] {
+        query::result_view::consume(rows, slice, cql3::selection::result_set_builder::visitor(builder, *_query_schema, *_selection));
+        return builder.build();
+    });
+
+    const auto column = *_bm25_ordering_info.highlight_column_selector_index;
+    vector_search::vector_store_client::documents documents;
+    documents.reserve(harvested->size());
+    for (const auto& row : harvested->rows()) {
+        const auto& cell = row[column];
+        documents.push_back(cell ? value_cast<sstring>(utf8_type->deserialize(*cell)) : sstring{});
+    }
+
+    auto highlights = co_await qp.vector_store_client().highlight(
+            _schema->ks_name(), _index.metadata().name(), search_term, std::move(documents), as);
+    if (!highlights.has_value()) {
+        co_await coroutine::return_exception(
+                exceptions::invalid_request_exception(std::visit(vector_search::vector_store_client::fts_error_visitor{}, highlights.error())));
+    }
+    co_return std::move(highlights).value();
 }
 
 } // namespace cql3::statements

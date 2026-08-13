@@ -2125,6 +2125,15 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
         }
     }
 
+    // Same treatment for HIGHLIGHT(): replaced with an external_value node whose slot is filled
+    // at runtime with the excerpt computed by the Vector Store.
+    if (prepare_highlight_selectors(prepared_selectors, bm25_ordering_info_opt, next_external_value_index)) {
+        ++next_external_value_index;
+        for (auto& term : bm25_ordering_info_opt->selected_highlight_terms) {
+            expr::fill_prepare_context(term, ctx);
+        }
+    }
+
     for (auto& ps : prepared_selectors) {
         expr::fill_prepare_context(ps.expr, ctx);
     }

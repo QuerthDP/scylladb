@@ -585,6 +585,38 @@ def test_bm25_in_select_clause_different_term_rejected(cql, fulltext_table):
         cql.prepare(f"SELECT BM25(content, 'world') FROM {fulltext_table} WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT 10")
 
 
+def test_highlight_in_select_clause_rejected(cql, fulltext_table):
+    """HIGHLIGHT() in SELECT is rejected without both a BM25 WHERE and ORDER BY clause."""
+    with pytest.raises(InvalidRequest, match="not supported in the SELECT clause"):
+        cql.prepare(f"SELECT HIGHLIGHT(content, 'hello') FROM {fulltext_table}")
+
+
+def test_highlight_in_select_clause_with_where_order_by_accepted(cql, fulltext_table):
+    """HIGHLIGHT() in SELECT is accepted when the query has both a BM25 WHERE and ORDER BY."""
+    cql.prepare(f"SELECT HIGHLIGHT(content, 'hello') FROM {fulltext_table} WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT 10")
+
+
+def test_highlight_different_term_rejected(cql, fulltext_table):
+    """HIGHLIGHT() with a different literal search term than ORDER BY must be rejected at prepare time."""
+    with pytest.raises(InvalidRequest, match="same search term"):
+        cql.prepare(f"SELECT HIGHLIGHT(content, 'world') FROM {fulltext_table} WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT 10")
+
+
+def test_highlight_different_column_rejected(cql, test_keyspace):
+    """HIGHLIGHT() on a column other than the one BM25() searches must be rejected at prepare time."""
+    schema = 'id int primary key, content text, other text'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(content) USING 'fulltext_index'")
+        with pytest.raises(InvalidRequest, match="same column"):
+            cql.prepare(f"SELECT HIGHLIGHT(other, 'hello') FROM {table} WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT 10")
+
+
+def test_highlight_non_column_first_argument_rejected(cql, fulltext_table):
+    """The first argument to HIGHLIGHT() must be a column reference."""
+    with pytest.raises(InvalidRequest, match="must be a column reference"):
+        cql.prepare(f"SELECT HIGHLIGHT('literal', 'hello') FROM {fulltext_table} WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT 10")
+
+
 def test_bm25_on_partition_key_rejected(cql, test_keyspace):
     """Creating a fulltext index on a partition key column must be rejected."""
     schema = 'p text primary key'

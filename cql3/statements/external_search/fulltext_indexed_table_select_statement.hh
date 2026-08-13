@@ -19,6 +19,12 @@ struct bm25_ordering_info {
     expr::expression search_term;
     std::optional<size_t> external_value_index;
     std::vector<expr::expression> selected_bm25_terms;
+    std::optional<size_t> highlight_external_value_index;
+    std::vector<expr::expression> selected_highlight_terms;
+    /// The indexed text column that HIGHLIGHT() excerpts, and its position in the selection.
+    /// The column is fetched from the base table so its text can be sent to the Vector Store.
+    const column_definition* highlight_column = nullptr;
+    std::optional<uint32_t> highlight_column_selector_index;
 };
 
 /// Resolves BM25 ordering metadata from the query's ORDER BY clause.
@@ -37,6 +43,13 @@ std::optional<bm25_ordering_info> get_bm25_ordering_info(
 /// Stores index into ordering_info->external_value_index on first bm25() occurrence.
 /// Returns true if any bm25() call was found and processed.
 bool prepare_bm25_selectors(std::vector<selection::prepared_selector>& prepared_selectors, std::optional<bm25_ordering_info>& ordering_info, size_t index);
+
+/// Same as prepare_bm25_selectors(), but for highlight() calls. Replaces each with
+/// external_value{index, utf8_type}; the slot is filled at execute time with the excerpt
+/// the Vector Store computed from the row's own text.
+/// Returns true if any highlight() call was found and processed.
+bool prepare_highlight_selectors(
+        std::vector<selection::prepared_selector>& prepared_selectors, std::optional<bm25_ordering_info>& ordering_info, size_t index);
 
 class fulltext_indexed_table_select_statement : public external_index_select_statement {
     bm25_ordering_info _bm25_ordering_info;
@@ -71,6 +84,11 @@ private:
 
     future<::shared_ptr<cql_transport::messages::result_message>> execute_search(
             query_processor& qp, service::query_state& state, const query_options& options, uint64_t limit) const override;
+
+    /// Reads the indexed text out of the already-fetched base-table rows and asks the Vector Store
+    /// to excerpt it. Returns one excerpt per row, in row order.
+    future<vector_search::vector_store_client::highlights> fetch_highlights(query_processor& qp, const query_options& options,
+            const query::result& rows, const query::partition_slice& slice, const sstring& search_term, abort_source& as) const;
 };
 
 } // namespace cql3::statements

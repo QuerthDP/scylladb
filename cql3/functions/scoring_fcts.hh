@@ -15,5 +15,7 @@ namespace functions {
 
 shared_ptr<function> make_bm25_function();
 
+shared_ptr<function> make_highlight_function();
+
 } // namespace functions
 } // namespace cql3

@@ -38,12 +38,18 @@ public:
             const secondary_index::index& index,
             std::unique_ptr<cql3::attributes> attrs);
 
+    /// Builds the external values provider once the base-table rows are in. Taking the fetched
+    /// rows lets a provider derive its values from them - e.g. asking the index node to highlight
+    /// the text it just read - before the result rows are assembled.
+    using external_values_provider_factory = noncopyable_function<future<std::unique_ptr<cql3::selection::external_values_provider>>(
+            const query::result&, const query::partition_slice&)>;
+
 protected:
     lw_shared_ptr<query::read_command> prepare_command_for_base_query(query_processor& qp, service::query_state& state, const query_options& options, uint64_t fetch_limit) const;
 
     future<::shared_ptr<cql_transport::messages::result_message>> query_base_table(query_processor& qp, service::query_state& state,
             const query_options& options, const std::vector<vector_search::primary_key>& pkeys, lowres_clock::time_point timeout,
-            std::unique_ptr<cql3::selection::external_values_provider> provider = nullptr) const;
+            external_values_provider_factory make_provider = {}) const;
 
     future<coordinator_result<foreign_ptr<lw_shared_ptr<query::result>>>> query_base_table(query_processor& qp, service::query_state& state,
             const query_options& options, lw_shared_ptr<query::read_command> command, lowres_clock::time_point timeout,

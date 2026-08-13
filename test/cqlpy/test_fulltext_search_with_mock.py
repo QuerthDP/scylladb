@@ -314,3 +314,172 @@ def test_bm25_hidden_pk_columns_not_leaked(cql, test_keyspace, vector_store_mock
                     assert row.pk == pk
                 if "content" in expected_fields:
                     assert row.content == "hello"
+
+
+def highlight_response(fragments):
+    return json.dumps({"highlights": list(fragments)})
+
+
+def test_highlight_returns_excerpts(cql, test_keyspace, vector_store_mock):
+    """SELECT HIGHLIGHT() must send the rows' own text to the vector store and return the excerpts it computes."""
+    schema = "id int primary key, content text"
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(content) USING 'fulltext_index'")
+
+        texts = {0: "a quick brown fox", 1: "the lazy dog", 2: "another fox story"}
+        for id, text in texts.items():
+            cql.execute(f"INSERT INTO {table} (id, content) VALUES ({id}, '{text}')")
+
+        ids = [2, 0, 1]
+        vector_store_mock.set_next_bm25_response(200, bm25_response(ids))
+        vector_store_mock.set_next_highlight_response(200, highlight_response(
+            [f"<b>{texts[id]}</b>" for id in ids]))
+
+        rows = list(cql.execute(
+            f"SELECT id, HIGHLIGHT(content, 'fox') AS excerpt FROM {table} "
+            f"WHERE BM25(content, 'fox') > 0 ORDER BY BM25(content, 'fox') LIMIT 3"))
+
+        assert [r.id for r in rows] == ids
+        assert [r.excerpt for r in rows] == [f"<b>{texts[id]}</b>" for id in ids]
+
+        # The text shipped to the vector store is the base-table text of the matched
+        # rows, in the order the vector store ranked them.
+        assert len(vector_store_mock.highlight_requests) == 1
+        request = json.loads(vector_store_mock.highlight_requests[0].body)
+        assert request["query"] == "fox"
+        assert request["documents"] == [texts[id] for id in ids]
+
+
+def test_highlight_and_bm25_together(cql, test_keyspace, vector_store_mock):
+    """HIGHLIGHT() and BM25() in the same SELECT must each get their own value slot."""
+    schema = "id int primary key, content text"
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(content) USING 'fulltext_index'")
+        for id in range(2):
+            cql.execute(f"INSERT INTO {table} (id, content) VALUES ({id}, 'hello world')")
+
+        vector_store_mock.set_next_bm25_response(200, bm25_response([1, 0], scores=[2.5, 1.5]))
+        vector_store_mock.set_next_highlight_response(200, highlight_response(["<b>hello</b> one", "<b>hello</b> two"]))
+
+        rows = list(cql.execute(
+            f"SELECT id, BM25(content, 'hello') AS score, HIGHLIGHT(content, 'hello') AS excerpt FROM {table} "
+            f"WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT 2"))
+
+        assert [r.id for r in rows] == [1, 0]
+        assert [r.score for r in rows] == [pytest.approx(2.5), pytest.approx(1.5)]
+        assert [r.excerpt for r in rows] == ["<b>hello</b> one", "<b>hello</b> two"]
+
+
+def test_highlight_without_selecting_content(cql, test_keyspace, vector_store_mock):
+    """The indexed column is fetched to feed the highlighter, but must not leak into the result."""
+    schema = "id int primary key, content text"
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(content) USING 'fulltext_index'")
+        cql.execute(f"INSERT INTO {table} (id, content) VALUES (0, 'hello world')")
+
+        vector_store_mock.set_next_bm25_response(200, bm25_response([0]))
+        vector_store_mock.set_next_highlight_response(200, highlight_response(["<b>hello</b> world"]))
+
+        rows = list(cql.execute(
+            f"SELECT HIGHLIGHT(content, 'hello') AS excerpt FROM {table} "
+            f"WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT 1"))
+
+        assert set(rows[0]._fields) == {"excerpt"}
+        assert rows[0].excerpt == "<b>hello</b> world"
+        assert json.loads(vector_store_mock.highlight_requests[0].body)["documents"] == ["hello world"]
+
+
+def test_highlight_with_clustering_key(cql, test_keyspace, vector_store_mock):
+    """Highlights must stay attached to the right row on a table with a clustering key."""
+    schema = "pk int, ck int, content text, PRIMARY KEY (pk, ck)"
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(content) USING 'fulltext_index'")
+
+        items = [(1, 10, "first hello"), (2, 20, "second hello")]
+        for pk, ck, content in items:
+            cql.execute(f"INSERT INTO {table} (pk, ck, content) VALUES ({pk}, {ck}, '{content}')")
+
+        vector_store_mock.set_next_bm25_response(200, json.dumps({
+            "primary_keys": {"pk": [2, 1], "ck": [20, 10]},
+            "scores": [2.0, 1.0],
+        }))
+        vector_store_mock.set_next_highlight_response(200, highlight_response(["second <b>hello</b>", "first <b>hello</b>"]))
+
+        rows = list(cql.execute(
+            f"SELECT pk, HIGHLIGHT(content, 'hello') AS excerpt FROM {table} "
+            f"WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT 2"))
+
+        assert [(r.pk, r.excerpt) for r in rows] == [(2, "second <b>hello</b>"), (1, "first <b>hello</b>")]
+        assert json.loads(vector_store_mock.highlight_requests[0].body)["documents"] == ["second hello", "first hello"]
+
+
+def test_highlight_null_content_sends_empty_document(cql, test_keyspace, vector_store_mock):
+    """A row whose indexed column is null still gets a slot in the highlight request."""
+    schema = "id int primary key, content text"
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(content) USING 'fulltext_index'")
+        cql.execute(f"INSERT INTO {table} (id, content) VALUES (0, 'hello world')")
+        cql.execute(f"INSERT INTO {table} (id) VALUES (1)")
+
+        vector_store_mock.set_next_bm25_response(200, bm25_response([0, 1]))
+        vector_store_mock.set_next_highlight_response(200, highlight_response(["<b>hello</b> world", ""]))
+
+        rows = list(cql.execute(
+            f"SELECT id, HIGHLIGHT(content, 'hello') AS excerpt FROM {table} "
+            f"WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT 2"))
+
+        assert json.loads(vector_store_mock.highlight_requests[0].body)["documents"] == ["hello world", ""]
+        assert [r.excerpt for r in rows] == ["<b>hello</b> world", ""]
+
+
+def test_highlight_no_results_skips_the_call(cql, fts_table, vector_store_mock):
+    """With no search results there is nothing to excerpt, so no highlight request is made."""
+    table, _ = fts_table
+
+    vector_store_mock.set_next_bm25_response(200, bm25_response([]))
+    rows = list(cql.execute(
+        f"SELECT id, HIGHLIGHT(content, 'nomatch') AS excerpt FROM {table} "
+        f"WHERE BM25(content, 'nomatch') > 0 ORDER BY BM25(content, 'nomatch') LIMIT 5"))
+
+    assert rows == []
+    assert vector_store_mock.highlight_requests == []
+
+
+def test_highlight_vector_store_error_raises(cql, fts_table, vector_store_mock):
+    """A failing highlight call must surface as a request error, not a partial result."""
+    table, _ = fts_table
+
+    vector_store_mock.set_next_bm25_response(200, bm25_response(RESPONSE_PK_REVERSED))
+    vector_store_mock.set_next_highlight_response(500, '"highlighting exploded"')
+
+    with pytest.raises(InvalidRequest):
+        cql.execute(f"SELECT id, HIGHLIGHT(content, 'hello') AS excerpt FROM {table} "
+                    f"WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT {NUM_ROWS}")
+
+
+def test_highlight_bind_marker_mismatch_raises(cql, fts_setup_with_mock, vector_store_mock):
+    """HIGHLIGHT() with a bind marker that evaluates to a different term than ORDER BY must raise."""
+    table, _ = fts_setup_with_mock
+
+    stmt = cql.prepare(
+        f"SELECT id, HIGHLIGHT(content, ?) AS excerpt FROM {table} "
+        f"WHERE BM25(content, ?) > 0 ORDER BY BM25(content, ?) LIMIT {NUM_ROWS}")
+    vector_store_mock.set_next_highlight_response(200, highlight_response(["x"] * NUM_ROWS))
+    cql.execute(stmt, ["hello", "hello", "hello"])
+
+    vector_store_mock.set_next_bm25_response(200, bm25_response(RESPONSE_PK_REVERSED))
+    with pytest.raises(InvalidRequest, match="same search term"):
+        cql.execute(stmt, ["world", "hello", "hello"])
+
+
+def test_highlight_nested_unaliased_column_name(cql, fts_setup_with_mock, vector_store_mock):
+    """SELECT UPPER(HIGHLIGHT(...)) without an alias must not leak internal @external_value in the column name."""
+    table, _ = fts_setup_with_mock
+    vector_store_mock.set_next_highlight_response(200, highlight_response(["hi"] * NUM_ROWS))
+
+    rows = list(cql.execute(
+        f"SELECT CAST(HIGHLIGHT(content, 'hello') AS text) FROM {table} "
+        f"WHERE BM25(content, 'hello') > 0 ORDER BY BM25(content, 'hello') LIMIT {NUM_ROWS}"))
+    col_names = rows[0]._fields
+    assert any("highlight" in name.lower() for name in col_names), f"Expected HIGHLIGHT column name, got {col_names}"
+    assert not any("external_value" in name for name in col_names), f"Internal name leaked: {col_names}"

@@ -53,6 +53,8 @@ using json_content = sstring;
 using milliseconds = std::chrono::milliseconds;
 using operation_type = httpd::operation_type;
 using port_number = vector_search::vector_store_client::port_number;
+using documents = vector_search::vector_store_client::documents;
+using highlights = vector_search::vector_store_client::highlights;
 using primary_key = vector_search::primary_key;
 using primary_keys = vector_search::vector_store_client::primary_keys;
 using service_reply_format_error = vector_search::vector_store_client::service_reply_format_error;
@@ -220,6 +222,39 @@ auto write_bm25_json(query_string query, limit limit) -> json_content {
 
 auto read_bm25_json(rjson::value const& json, schema_ptr const& schema) -> std::expected<primary_keys, fts_error> {
     return read_scored_primary_keys_json(json, schema, "scores");
+}
+
+auto write_highlight_json(query_string query, documents const& docs) -> json_content {
+    auto quoted = std::vector<std::string>{};
+    quoted.reserve(docs.size());
+    for (auto const& doc : docs) {
+        quoted.push_back(rjson::print(rjson::from_string(doc)));
+    }
+    return seastar::format(R"({{"query":{},"documents":[{}]}})", rjson::from_string(query), fmt::join(quoted, ","));
+}
+
+auto read_highlight_json(rjson::value const& json, std::size_t expected_size) -> std::expected<highlights, fts_error> {
+    auto const* highlights_json = rjson::find(json, "highlights");
+    if (highlights_json == nullptr || !highlights_json->IsArray()) {
+        vslogger.error("Vector Store returned invalid JSON: missing or non-array 'highlights'");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    auto const& arr = highlights_json->GetArray();
+    if (arr.Size() != expected_size) {
+        vslogger.error("Vector Store returned {} highlights for {} documents", arr.Size(), expected_size);
+        return std::unexpected{service_reply_format_error{}};
+    }
+
+    auto result = highlights{};
+    result.reserve(arr.Size());
+    for (auto const& item : arr) {
+        if (!item.IsString()) {
+            vslogger.error("Vector Store returned invalid JSON: highlight is not a string");
+            return std::unexpected{service_reply_format_error{}};
+        }
+        result.emplace_back(rjson::to_string_view(item));
+    }
+    return result;
 }
 
 bool should_vector_store_service_be_disabled(std::vector<sstring> const& uris) {
@@ -436,6 +471,43 @@ struct vector_store_client::impl {
         }
     }
 
+    auto highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents docs, abort_source& as)
+            -> future<std::expected<highlights, fts_error>> {
+        if (is_disabled()) {
+            vslogger.error("Disabled Vector Store while calling highlight");
+            co_return std::unexpected{disabled{}};
+        }
+        if (docs.empty()) {
+            co_return highlights{};
+        }
+
+        auto path = format("/api/v1/indexes/{}/{}/highlight", keyspace, name);
+        auto expected_size = docs.size();
+        auto content = write_highlight_json(std::move(fts_query), docs);
+
+        auto resp = co_await request(operation_type::POST, std::move(path), std::move(content), as);
+        if (!resp) {
+            co_return std::unexpected{std::visit(
+                    [](auto&& err) {
+                        return fts_error{err};
+                    },
+                    resp.error())};
+        }
+
+        if (resp->status != status_type::ok) {
+            auto error_content = decode_error_message(resp->content);
+            vslogger.error("Vector Store returned error: HTTP status {}: {}", resp->status, error_content);
+            co_return std::unexpected{service_error{resp->status, std::move(error_content)}};
+        }
+
+        try {
+            co_return read_highlight_json(rjson::parse(std::move(resp->content)), expected_size);
+        } catch (const rjson::error& e) {
+            vslogger.error("Vector Store returned invalid JSON: {}", e.what());
+            co_return std::unexpected{service_reply_format_error{}};
+        }
+    }
+
 
     future<clients::request_result> request(
             seastar::httpd::operation_type method, seastar::sstring path, std::optional<seastar::sstring> content, seastar::abort_source& as) {
@@ -495,6 +567,11 @@ auto vector_store_client::ann(keyspace_name keyspace, index_name name, schema_pt
 auto vector_store_client::bm25(keyspace_name keyspace, index_name name, schema_ptr schema, query_string fts_query, limit limit, abort_source& as)
         -> future<std::expected<primary_keys, fts_error>> {
     return _impl->bm25(std::move(keyspace), std::move(name), schema, std::move(fts_query), limit, as);
+}
+
+auto vector_store_client::highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents docs, abort_source& as)
+        -> future<std::expected<highlights, fts_error>> {
+    return _impl->highlight(std::move(keyspace), std::move(name), std::move(fts_query), std::move(docs), as);
 }
 
 void vector_store_client_tester::set_dns_refresh_interval(vector_store_client& vsc, std::chrono::milliseconds interval) {
