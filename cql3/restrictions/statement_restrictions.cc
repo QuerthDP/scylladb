@@ -29,6 +29,7 @@
 #include "cql3/functions/token_fct.hh"
 #include "dht/i_partitioner.hh"
 #include "db/schema_tables.hh"
+#include "index/secondary_index.hh"
 #include "types/tuple.hh"
 #include "utils/overloaded_functor.hh"
 
@@ -54,6 +55,34 @@ namespace cql3 {
 namespace restrictions {
 
 using namespace expr;
+
+// An index without a view serves only its own search queries, so a restriction
+// on its column can only be filtered. Name the index, so that it is clear why
+// it is not used.
+static void throw_if_restricted_column_has_index_without_view(
+        const secondary_index::secondary_index_manager& sim, const expression& restrictions) {
+    static const std::unordered_map<sstring, std::string_view> served_queries = {
+        {"vector_index", "Vector indexes only support ANN queries"},
+        {"fulltext_index", "Full-text indexes only support BM25 queries"},
+        {"pattern_index", "Pattern indexes only support LIKE queries"},
+    };
+    for_each_expression<column_value>(restrictions, [&] (const column_value& cv) {
+        const auto& column = cv.col->name_as_text();
+        for (const auto& idx : sim.list_indexes()) {
+            const auto& im = idx.metadata();
+            if (idx.target_column() != column || db::schema_tables::view_should_exist(im)) {
+                continue;
+            }
+            auto class_name = im.options().at(db::index::secondary_index::custom_class_option_name);
+            std::ranges::transform(class_name, class_name.begin(), ::tolower);
+            if (auto it = served_queries.find(class_name); it != served_queries.end()) {
+                throw exceptions::invalid_request_exception(seastar::format(
+                        "{}: index {} on column {} cannot serve this restriction. Use ALLOW FILTERING to filter on {}.",
+                        it->second, im.name(), column, column));
+            }
+        }
+    });
+}
 
 static logging::logger rlogger("restrictions");
 static auto& expr_logger = rlogger; // compatibility with code moved from expression.cc
@@ -1547,6 +1576,10 @@ void select_restrictions::plan_query(
         if (_has_queriable_regular_index && _analysis.partition_range_is_simple) {
             _uses_secondary_indexing = true;
         } else if (!_allow_filtering) {
+            if (_check_indexes) {
+                throw_if_restricted_column_has_index_without_view(
+                        db.find_column_family(_analysis.schema).get_index_manager(), _analysis.nonprimary_key_restrictions);
+            }
             throw exceptions::invalid_request_exception("Cannot execute this query as it might involve data filtering and "
                 "thus may have unpredictable performance. If you want to execute "
                 "this query despite the performance unpredictability, use ALLOW FILTERING");

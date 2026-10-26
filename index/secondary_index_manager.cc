@@ -27,6 +27,7 @@
 #include "cql3/util.hh"
 #include "index/target_parser.hh"
 #include "schema/schema.hh"
+#include "db/schema_tables.hh"
 #include "utils/histogram_metrics_helper.hh"
 
 seastar::metrics::label idx{"idx"};
@@ -59,7 +60,8 @@ index::supports_expression_v index::supports_expression(const column_definition&
 
     switch (op) {
         case cql3::expr::oper_t::EQ:
-            return supports_expression_v::from_bool(_target_type == target_type::regular_values); 
+            // Without a view there is nothing to look the value up in.
+            return supports_expression_v::from_bool(_target_type == target_type::regular_values && db::schema_tables::view_should_exist(_im));
         case cql3::expr::oper_t::CONTAINS:
             if (cdef.type->is_set() && _target_type == target_type::keys) {
                 return collection_yes;
